@@ -105,7 +105,9 @@ COINGECKO_PLATFORMS = {
 ALCHEMY_CHAINS = {
     'ethereum': 'eth-mainnet',
     'polygon': 'polygon-mainnet',
-    'base': 'base-mainnet'
+    'base': 'base-mainnet',
+    'bsc': 'bsc-mainnet',
+    'solana': 'solana-mainnet'
 }
 
 DEXSCREENER_CHAINS = {
@@ -1525,6 +1527,7 @@ async def get_token_price(address, chain, bot):
     cache_key = f"{chain}:{address}"
     current_time = time.time()
 
+    # Check cache
     if (cache_key in price_cache and cache_key in symbol_cache and cache_key in market_cap_cache and
         current_time - price_cache[cache_key][1] < CACHE_DURATION and
         current_time - symbol_cache[cache_key][1] < CACHE_DURATION and
@@ -1535,6 +1538,7 @@ async def get_token_price(address, chain, bot):
         logger.debug(f"Using cached data for {cache_key}: price=${price}, symbol={symbol}, market_cap=${market_cap}")
         return price, symbol, market_cap
 
+    # Validate address format
     if not re.match(r'^0x[a-fA-F0-9]{40}$|^[1-9A-HJ-NP-Za-km-z]{32,44}$|^0:[a-fA-F0-9]{64}$|^[A-Za-z0-9_-]{48}$', address):
         logger.warning(f"Invalid address format for {cache_key}")
         return None, None, None
@@ -1542,33 +1546,14 @@ async def get_token_price(address, chain, bot):
     price = None
     symbol = None
     market_cap = None
+
     async with aiohttp.ClientSession() as session:
-        try:
-            if chain == 'ton':
-                # Use CoinGecko for TON tokens
-                platform = COINGECKO_PLATFORMS.get(chain, 'the-open-network')
-                url = f"https://api.coingecko.com/api/v3/coins/{platform}/contract/{address}"
-                logger.debug(f"Fetching CoinGecko data for {cache_key}: {url}")
-                async with session.get(url, timeout=10) as response:
-                    await asyncio.sleep(0.1)
-                    if response.status != 200:
-                        logger.error(f"CoinGecko API error for TON: Status {response.status}, URL: {url}")
-                        failed_attempts[cache_key] = failed_attempts.get(cache_key, 0) + 1
-                        return None, None, None
-                    res = await response.json()
-                    if 'error' in res:
-                        logger.warning(f"CoinGecko error for {cache_key}: {res['error']}")
-                        failed_attempts[cache_key] = failed_attempts.get(cache_key, 0) + 1
-                        return None, None, None
-                    price = float(res.get('market_data', {}).get('current_price', {}).get('usd', 0))
-                    symbol = res.get('symbol', f"Unknown_{address[-6:]}").upper()
-                    market_cap = float(res.get('market_data', {}).get('market_cap', {}).get('usd', 0))
-                    failed_attempts[cache_key] = 0
-                    logger.info(f"CoinGecko data for {cache_key}: price=${price}, symbol={symbol}, market_cap=${market_cap}")
-            elif chain in DEXSCREENER_CHAINS:
-                chain_id = DEXSCREENER_CHAINS[chain]
-                url = f"{DEXSCREENER_TOKEN_API}{address}"
-                logger.debug(f"Fetching DexScreener data for {cache_key}: {url}")
+        # Primary source: DexScreener for all chains
+        if chain in DEXSCREENER_CHAINS:
+            chain_id = DEXSCREENER_CHAINS[chain]
+            url = f"{DEXSCREENER_TOKEN_API}{address}"
+            logger.debug(f"Fetching DexScreener data for {cache_key}: {url}")
+            try:
                 async with session.get(url, timeout=10) as response:
                     await asyncio.sleep(0.1)
                     if response.status != 200:
@@ -1587,26 +1572,16 @@ async def get_token_price(address, chain, bot):
                                 market_cap = float(target_pair.get('marketCap', 0))
                                 failed_attempts[cache_key] = 0
                                 logger.info(f"DexScreener data for {cache_key}: price=${price}, symbol={symbol}, market_cap=${market_cap}")
-            else:
-                logger.warning(f"Unsupported chain for {cache_key}")
-                return None, None, None
-        except Exception as e:
-            logger.error(f"Error fetching price for {cache_key}: {e}")
-            failed_attempts[cache_key] = failed_attempts.get(cache_key, 0) + 1
-            if failed_attempts[cache_key] >= 5:
-                for admin_id in ADMIN_IDS:
-                    await bot.send_message(
-                        chat_id=admin_id,
-                        text=f"Token {address} on {chain} failed 5 times. Skipping."
-                    )
-                    await asyncio.sleep(0.1)
-            return None, None, None
+            except Exception as e:
+                logger.error(f"DexScreener error for {cache_key}: {e}")
 
-        if chain in ALCHEMY_CHAINS and price is None:
+        # Secondary source: Alchemy for supported chains
+        if (price is None or symbol is None or market_cap is None) and chain in ALCHEMY_CHAINS:
             try:
                 alchemy_chain = ALCHEMY_CHAINS[chain]
                 alchemy_url = f"https://{_get_alchemy_api_key(alchemy_chain)}/v2/{alchemy_chain}"
-                payload = {
+                # Fetch symbol using eth_call
+                payload_symbol = {
                     "jsonrpc": "2.0",
                     "method": "eth_call",
                     "params": [
@@ -1619,135 +1594,215 @@ async def get_token_price(address, chain, bot):
                     "id": 1
                 }
                 headers = {"Content-Type": "application/json"}
-                async with session.post(alchemy_url, json=payload, headers=headers, timeout=10) as response:
+                async with session.post(alchemy_url, json=payload_symbol, headers=headers, timeout=10) as response:
                     await asyncio.sleep(0.1)
                     if response.status != 200:
-                        logger.error(f"Alchemy API error: Status {response.status} for {alchemy_url}")
+                        logger.error(f"Alchemy API error for symbol: Status {response.status} for {alchemy_url}")
                     else:
                         res = await response.json()
                         if 'result' in res and res['result'] != '0x':
                             name_hex = res['result'][130:]  # Skip offset and length
-                            symbol = bytearray.fromhex(name_hex).decode('utf-8', errors='ignore').strip()
+                            symbol = bytearray.fromhex(name_hex).decode('utf-8', errors='ignore').strip().upper()
                             if symbol:
                                 logger.debug(f"Alchemy symbol for {cache_key}: {symbol}")
-                if price is None:
-                    logger.debug(f"Alchemy price fetch not implemented for {cache_key}")
+                # Alchemy does not provide price or market cap directly
+                logger.debug(f"Alchemy price/market cap fetch not implemented for {cache_key}")
             except Exception as e:
                 logger.error(f"Alchemy error for {cache_key}: {e}")
 
-        if price is None or symbol is None or market_cap is None:
-            failed_attempts[cache_key] = failed_attempts.get(cache_key, 0) + 1
-            logger.warning(f"Failed to retrieve valid data for {cache_key}: price={price}, symbol={symbol}, market_cap={market_cap}")
-            return None, None, None
+        # Tertiary source: CoinGecko for supported chains
+        if (price is None or symbol is None or market_cap is None) and chain in COINGECKO_PLATFORMS:
+            try:
+                platform = COINGECKO_PLATFORMS.get(chain, chain)
+                url = f"https://api.coingecko.com/api/v3/coins/{platform}/contract/{address}"
+                logger.debug(f"Fetching CoinGecko data for {cache_key}: {url}")
+                async with session.get(url, timeout=10) as response:
+                    await asyncio.sleep(0.1)
+                    if response.status != 200:
+                        logger.error(f"CoinGecko API error: Status {response.status}, URL: {url}")
+                    else:
+                        res = await response.json()
+                        if 'error' not in res:
+                            price = float(res.get('market_data', {}).get('current_price', {}).get('usd', 0))
+                            symbol = res.get('symbol', f"Unknown_{address[-6:]}").upper()
+                            market_cap = float(res.get('market_data', {}).get('market_cap', {}).get('usd', 0))
+                            failed_attempts[cache_key] = 0
+                            logger.info(f"CoinGecko data for {cache_key}: price=${price}, symbol={symbol}, market_cap=${market_cap}")
+            except Exception as e:
+                logger.error(f"CoinGecko error for {cache_key}: {e}")
 
-        price_cache[cache_key] = (price, current_time)
-        symbol_cache[cache_key] = (symbol, current_time)
-        market_cap_cache[cache_key] = (market_cap, current_time)
-        logger.info(f"Cached data for {cache_key}: price=${price}, symbol={symbol}, market_cap=${market_cap}")
-        return price, symbol, market_cap
+        # Quaternary source: GMGN for Solana, Ethereum, BSC, Base
+        if (price is None or symbol is None or market_cap is None) and chain in ['solana', 'ethereum', 'bsc', 'base']:
+            try:
+                if chain == 'solana':
+                    url = f"{GMGN_SOLANA_API}?address={address}&chain={chain}"
+                else:
+                    url = f"{GMGN_ETH_BSC_BASE_API}?address={address}&chain={chain}"
+                logger.debug(f"Fetching GMGN data for {cache_key}: {url}")
+                async with session.get(url, timeout=10) as response:
+                    await asyncio.sleep(0.1)
+                    if response.status != 200:
+                        logger.error(f"GMGN API error: Status {response.status}, URL: {url}")
+                    else:
+                        res = await response.json()
+                        if res.get('success'):
+                            price = float(res.get('price', {}).get('usd', 0))
+                            symbol = res.get('token', {}).get('symbol', f"Unknown_{address[-6:]}").upper()
+                            market_cap = float(res.get('market_cap', 0))
+                            failed_attempts[cache_key] = 0
+                            logger.info(f"GMGN data for {cache_key}: price=${price}, symbol={symbol}, market_cap=${market_cap}")
+            except Exception as e:
+                logger.error(f"GMGN error for {cache_key}: {e}")
+
+   # Update failed attempts
+    if price is None or symbol is None or market_cap is None:
+        failed_attempts[cache_key] = failed_attempts.get(cache_key, 0) + 1
+        if failed_attempts[cache_key] >= 5:
+            logger.warning(f"Max failed attempts reached for {cache_key}. Skipping future attempts.")
+            for admin_id in ADMIN_IDS:
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text=f"Token {cache_key} failed 5 times. Removed from price fetching."
+                )
+        return None, None, None
+
+    # Cache results
+    price_cache[cache_key] = (price, current_time)
+    symbol_cache[cache_key] = (symbol, current_time)
+    market_cap_cache[cache_key] = (market_cap, current_time)
+
+    return price, symbol, market_cap
 
 def _get_alchemy_api_key(chain):
-    api_keys = {
-        'eth-mainnet': os.getenv('ALCHEMY_API_KEY_ETHEREUM'),
-        'polygon-mainnet': os.getenv('ALCHEMY_API_KEY_POLYGON'),
-        'base-mainnet': os.getenv('ALCHEMY_API_KEY_BASE')
-    }
-    return api_keys.get(chain, os.getenv('ALCHEMY_API_KEY_ETHEREUM', ''))
+    load_dotenv()
+    api_key = os.getenv(f'ALCHEMY_API_KEY_{chain.upper()}')
+    if not api_key:
+        logger.error(f"No Alchemy API key found for {chain}")
+        return None
+    return api_key
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    logger.debug(f"User {user_id} issued /cancel command")
+    logger.debug(f"User {user_id} cancelled the operation")
     context.user_data.clear()
-    keyboard = [[InlineKeyboardButton("Back to Menu", callback_data='back_to_menu')]]
-    try:
-        await update.message.reply_text(
-            "Operation cancelled. Return to main menu?",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    except BadRequest as e:
-        logger.error(f"Failed to send cancel message: {e}")
-        await update.message.reply_text("Operation cancelled. Use /start to continue.")
+    keyboard = [
+        [InlineKeyboardButton("Monitor", callback_data='monitor')],
+        [InlineKeyboardButton("Unmonitor", callback_data='unmonitor')],
+        [InlineKeyboardButton("Watchlist", callback_data='watchlist')],
+        [InlineKeyboardButton("Top Monitored", callback_data='top_monitored')],
+        [InlineKeyboardButton("Leaderboard", callback_data='leaderboard')],
+    ]
+    if user_id in ADMIN_IDS:
+        keyboard.append([InlineKeyboardButton("📢 Broadcast Message", callback_data='broadcast')])
+        keyboard.append([InlineKeyboardButton("🗑️ Clear User Watchlist", callback_data='clear_watchlist')])
+        keyboard.append([InlineKeyboardButton("📣 Post Ad", callback_data='post_ad')])
+        keyboard.append([InlineKeyboardButton("📜 List Ads", callback_data='list_ads')])
+        keyboard.append([InlineKeyboardButton("🗑️ Delete Ad", callback_data='delete_ad')])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Operation cancelled. Choose an option:", reply_markup=reply_markup)
     await asyncio.sleep(0.1)
     return ConversationHandler.END
 
 def main():
     load_dotenv()
-    bot_token = os.getenv("BOT_TOKEN")
-    if not bot_token:
-        logger.error("BOT_TOKEN environment variable not set")
-        raise SystemExit("BOT_TOKEN not set")
+    token = os.getenv('TELEGRAM_BOT_TOKEN')
+    if not token:
+        logger.error("TELEGRAM_BOT_TOKEN not found in environment variables")
+        raise SystemExit("Bot token missing. Set TELEGRAM_BOT_TOKEN in .env file.")
 
     request = HTTPXRequest(
         connection_pool_size=20,
-        read_timeout=10.0,
-        write_timeout=10.0,
-        connect_timeout=10.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        connect_timeout=30.0,
         pool_timeout=30.0
     )
-    app = ApplicationBuilder().token(bot_token).request(request).build()
+
+    try:
+        app = ApplicationBuilder().token(token).request(request).build()
+    except Exception as e:
+        logger.error(f"Failed to initialize bot: {e}")
+        raise SystemExit("Failed to initialize bot. Check bot token and network.")
 
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler('start', start),
             CommandHandler('debug', debug_command),
-            CommandHandler('cancel', cancel),
-            CallbackQueryHandler(menu_handler, pattern='^(monitor|unmonitor|watchlist|top_monitored|leaderboard|broadcast|clear_watchlist|post_ad|list_ads|delete_ad|back_to_menu)$'),
-            CallbackQueryHandler(list_ads, pattern='^list_ads:'),
-            CallbackQueryHandler(delete_ad, pattern='^delete_ad:'),
-            CallbackQueryHandler(confirm_delete_ad, pattern='^confirm_delete:'),
+            CallbackQueryHandler(menu_handler)
         ],
         states={
-            ENTER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_address)],
+            ENTER_ADDRESS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_address),
+                CallbackQueryHandler(back_to_menu, pattern='back_to_menu')
+            ],
             SELECT_CHAIN: [CallbackQueryHandler(select_chain)],
             SELECT_MONITOR_TYPE: [CallbackQueryHandler(select_monitor_type)],
-            ENTER_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_value)],
+            ENTER_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, enter_value),
+                CallbackQueryHandler(back_to_menu, pattern='back_to_menu')
+            ],
             BROADCAST_TYPE: [CallbackQueryHandler(broadcast_type)],
-            BROADCAST_MESSAGE: [MessageHandler(filters.ALL & ~filters.COMMAND, broadcast_message)],
-            CONFIRM_UNMONITOR: [CallbackQueryHandler(confirm_unmonitor, pattern='^(unmonitor:|confirm_unmonitor:|back_to_menu$)')],
-            CONFIRM_TOKEN: [CallbackQueryHandler(confirm_token, pattern='^confirm_token:')],
-            ENTER_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_symbol)],
-            CLEAR_WATCHLIST: [MessageHandler(filters.TEXT & ~filters.COMMAND, clear_user_watchlist)],
-            POST_AD_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, post_ad_message)],
-            POST_AD_DURATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, post_ad_duration)],
-            POST_AD_VIEWS: [MessageHandler(filters.TEXT & ~filters.COMMAND, post_ad_views)],
-            DELETE_AD: [CallbackQueryHandler(confirm_delete_ad, pattern='^delete_ad:')],
-            CONFIRM_DELETE_AD: [CallbackQueryHandler(confirm_delete_ad, pattern='^confirm_delete:|^back_to_menu$')],
+            BROADCAST_MESSAGE: [
+                MessageHandler(filters.TEXT | filters.PHOTO | filters.VIDEO, broadcast_message),
+                CallbackQueryHandler(back_to_menu, pattern='back_to_menu')
+            ],
+            CONFIRM_UNMONITOR: [
+                CallbackQueryHandler(confirm_unmonitor, pattern='unmonitor:|confirm_unmonitor:'),
+                CallbackQueryHandler(back_to_menu, pattern='back_to_menu')
+            ],
+            CONFIRM_TOKEN: [
+                CallbackQueryHandler(confirm_token, pattern='confirm_token:'),
+                CallbackQueryHandler(back_to_menu, pattern='back_to_menu')
+            ],
+            ENTER_SYMBOL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, enter_symbol),
+                CallbackQueryHandler(back_to_menu, pattern='back_to_menu')
+            ],
+            CLEAR_WATCHLIST: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, clear_user_watchlist),
+                CallbackQueryHandler(back_to_menu, pattern='back_to_menu')
+            ],
+            POST_AD_MESSAGE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, post_ad_message),
+                CallbackQueryHandler(back_to_menu, pattern='back_to_menu')
+            ],
+            POST_AD_DURATION: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, post_ad_duration),
+                CallbackQueryHandler(back_to_menu, pattern='back_to_menu')
+            ],
+            POST_AD_VIEWS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, post_ad_views),
+                CallbackQueryHandler(back_to_menu, pattern='back_to_menu')
+            ],
+            DELETE_AD: [
+                CallbackQueryHandler(delete_ad, pattern='delete_ad:'),
+                CallbackQueryHandler(back_to_menu, pattern='back_to_menu')
+            ],
+            CONFIRM_DELETE_AD: [
+                CallbackQueryHandler(confirm_delete_ad, pattern='confirm_delete:|delete_ad:'),
+                CallbackQueryHandler(back_to_menu, pattern='back_to_menu')
+            ]
         },
         fallbacks=[
             CommandHandler('cancel', cancel),
-            CallbackQueryHandler(back_to_menu, pattern='^back_to_menu$'),
-            CallbackQueryHandler(readd_token, pattern='^readd_token:'),
+            CallbackQueryHandler(back_to_menu, pattern='back_to_menu'),
+            CallbackQueryHandler(readd_token, pattern='readd_token:')
         ],
-        per_user=True,
-        per_chat=True
+        per_message=False
     )
 
     app.add_handler(conv_handler)
     app.add_error_handler(error_handler)
 
-    async def start_monitoring():
-        try:
-            await monitor_tokens(app.bot)
-        except Exception as e:
-            logger.error(f"Error in monitor_tokens: {e}")
-            for admin_id in ADMIN_IDS:
-                try:
-                    await app.bot.send_message(chat_id=admin_id, text=f"Monitor tokens error: {e}")
-                except Exception as e2:
-                    logger.error(f"Failed to notify admin {admin_id}: {e2}")
+    async def run_monitor():
+        await monitor_tokens(app.bot)
 
-    app.job_queue.run_repeating(lambda context: asyncio.create_task(start_monitoring()), interval=35, first=10)
-
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-    logger.info("Bot started polling")
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+        app.create_task(run_monitor())
+    except Exception as e:
+        logger.error(f"Failed to start bot: {e}")
+        raise SystemExit("Bot failed to start. Check logs for details.")
 
 if __name__ == '__main__':
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-        db.close()
-    except Exception as e:
-        logger.error(f"Fatal error in main: {e}", exc_info=True)
-        db.close()
-        raise
+    main()
